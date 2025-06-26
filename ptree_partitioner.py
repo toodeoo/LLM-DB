@@ -30,27 +30,27 @@ class TreeNode:
         else:
             return f"Node(split_on='{self.split_column}' <= {self.split_value:.2f})"
 
-
-# --- 2. 主算法框架 (引入新配置) ---
-
 class PTreePartitioner:
     def __init__(self,
-                 max_depth=5,
+                 max_depth=10,
                  min_rows_per_partition=50,
                  top_k_candidates=5,
                  numeric_split_strategy='histogram',
-                 max_categorical_cardinality=20):
+                 max_categorical_cardinality=20,
+                 target_batch_size=None):
         """
         Args:
-            numeric_split_strategy (str): 数值列的分裂策略, 'quantile' 或 'histogram'.
-            max_categorical_cardinality (int): 处理类别列时，考虑的最大唯一值数量，防止组合爆炸。
+            target_batch_size (int, optional): The desired size for partitions.
+                                              If set, the tree will stop splitting a node
+                                              if its size is smaller than or equal to this value.
         """
         self.max_depth = max_depth
         self.min_rows_per_partition = min_rows_per_partition
         self.top_k_candidates = top_k_candidates
         self.numeric_split_strategy = numeric_split_strategy
         self.max_categorical_cardinality = max_categorical_cardinality
-        
+        self.target_batch_size = target_batch_size
+
         self.tree_ = None
         self.df_ = None
         self.col_widths_ = None
@@ -68,7 +68,14 @@ class PTreePartitioner:
         return self.tree_
 
     def _build_ptree(self, df: pd.DataFrame, depth: int):
-        if depth >= self.max_depth or len(df) <= self.min_rows_per_partition:
+        is_too_deep = depth >= self.max_depth
+        is_too_small = len(df) <= self.min_rows_per_partition
+        
+        is_batch_size_met = False
+        if self.target_batch_size is not None:
+            is_batch_size_met = len(df) <= self.target_batch_size
+
+        if is_too_deep or is_too_small or is_batch_size_met:
             final_order = self._find_final_optimal_order(df)
             return LeafNode(df.index, final_order)
 
@@ -81,7 +88,7 @@ class PTreePartitioner:
         split_col, split_val = best_split_info['column'], best_split_info['value']
         left_df, right_df = self._split_data(df, split_col, split_val)
         
-        if len(left_df) == 0 or len(right_df) == 0:
+        if len(left_df) < self.min_rows_per_partition or len(right_df) < self.min_rows_per_partition:
             final_order = self._find_final_optimal_order(df)
             return LeafNode(df.index, final_order)
 
@@ -91,14 +98,13 @@ class PTreePartitioner:
         right_child = self._build_ptree(right_df, depth + 1)
         return TreeNode(split_col, split_val, left_child, right_child)
 
-
     def _get_candidate_splits(self, df: pd.DataFrame):
         candidates = []
         for col in self.numerical_cols_:
             if col in self.cols_for_partitioning_:
                 if self.numeric_split_strategy == 'histogram':
                     candidates.extend(self._get_histogram_splits(df, col))
-                else: # 'quantile'
+                else:
                     candidates.extend(self._get_quantile_splits(df, col))
         
         for col in self.categorical_cols_:
@@ -204,42 +210,26 @@ class PTreePartitioner:
         if col not in df.columns:
             return 0
         return df[col].nunique()
-
-        # order_to_use = [c for c in column_order if c in df.columns]
-        # if not order_to_use:
-        #     return 0
-        # return df[order_to_use].astype(str).agg(''.join, axis=1).nunique()
         
-    # def _calculate_pu_multicolumn(self, df, column_order):
-    #     if df.empty or not column_order:
-    #         return 0
-    #     order_to_use = [c for c in column_order if c in df.columns]
-    #     if not order_to_use:
-    #         return 0
-    #     return df.groupby(order_to_use).ngroups
-
-    # def _calculate_lwpe(self, df, column_order):
-    #     if df.empty or not column_order: return 0.0
-    #     order_to_use = [c for c in column_order if c in df.columns]
-    #     if not order_to_use: return 0.0
-    #     prefixes = df[order_to_use].astype(str).agg(''.join, axis=1)
-    #     n = len(prefixes)
-    #     if n == 0: return 0.0
-    #     counts = Counter(prefixes)
-    #     prefix_len = sum(self.col_widths_.get(col, 1) for col in order_to_use)
-    #     entropy = -sum((f_p / n) * prefix_len * math.log(f_p / n) for p, f_p in counts.items() if f_p > 0)
-    #     return entropy
     def _calculate_lwpe(self, df, column_order):
         if df.empty or not column_order: return 0.0
         order_to_use = [c for c in column_order if c in df.columns]
         if not order_to_use: return 0.0
         n = len(df)
         if n == 0: return 0.0
-        counts = df.groupby(order_to_use).size()
-        prefix_len = sum(self.col_widths_.get(col, 1) for col in order_to_use)
-        probabilities = counts / n
-        entropy = -np.sum(probabilities * prefix_len * np.log(probabilities))
-        return entropy
+        
+        try:
+            counts = df.groupby(order_to_use, observed=True).size()
+            prefix_len = sum(self.col_widths_.get(col, 1) for col in order_to_use)
+            probabilities = counts / n
+            entropy = -np.sum(probabilities * prefix_len * np.log(probabilities))
+            return entropy
+        except Exception:
+            prefixes = df[order_to_use].astype(str).agg(''.join, axis=1)
+            counts = Counter(prefixes)
+            prefix_len = sum(self.col_widths_.get(col, 1) for col in order_to_use)
+            entropy = -sum((f_p / n) * prefix_len * math.log(f_p / n) for p, f_p in counts.items() if f_p > 0)
+            return entropy
 
     def _calculate_pu_gain(self, parent_df, left_df, right_df, pi_left, pi_right):
         parent_pu = self._calculate_pu(parent_df, pi_left)
@@ -265,7 +255,6 @@ class PTreePartitioner:
 
     def _identify_column_types(self):
         self.numerical_cols_ = [c for c in self.df_.select_dtypes(include=np.number).columns if c in self.cols_for_partitioning_]
-        # Treat bool as categorical
         self.categorical_cols_ = [c for c in self.df_.select_dtypes(include=['object', 'category', 'bool']).columns if c in self.cols_for_partitioning_]
         
     def get_partitions(self):
